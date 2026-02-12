@@ -102,6 +102,7 @@ namespace Microsoft.Azure.DataLake.Store
             Ex = null;
             Error = "";
             RequestId = "";
+            IsFileSymlink = "";
             LastCallLatency = TokenAcquisitionLatency = 0;
             ConnectionFailure = false;
         }
