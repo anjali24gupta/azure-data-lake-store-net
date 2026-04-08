@@ -60,6 +60,10 @@ namespace Microsoft.Azure.DataLake.Store
         /// </summary>
         public string RequestId { get; internal set; }
         /// <summary>
+        /// Indicates if the file is a symlink
+        /// </summary>
+        public string IsFileSymlink { get; internal set; }
+        /// <summary>
         /// Total latency for the last request for the operation
         /// </summary>
         public long LastCallLatency { get; internal set; }
