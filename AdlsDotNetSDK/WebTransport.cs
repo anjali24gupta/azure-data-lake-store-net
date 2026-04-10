@@ -54,22 +54,51 @@ namespace Microsoft.Azure.DataLake.Store
         /// </summary>
         private static HashSet<string> HeadersNotToBeCopied = new HashSet<string> {"Content-Type"};
 
+    /// <summary>
+    /// Counter to track total number of HTTP requests made through this HttpClient instance.
+    /// Helps verify that a single HttpClient is being reused (connection pooling).
+    /// </summary>
+    private static long _requestCount;
+
+    /// <summary>
+    /// Shared cookie container to preserve affinity cookies across requests.
+    /// </summary>
+    private static readonly CookieContainer _cookieContainer = new CookieContainer();
+
         /// <summary>
         /// Static constructor to initialize HttpClient once
         /// </summary>
         static WebTransport()
         {
+        
+
+            // Use HttpClientHandler for HTTP requests
             var handler = new HttpClientHandler
             {
                 AutomaticDecompression = DecompressionMethods.GZip | DecompressionMethods.Deflate,
-                AllowAutoRedirect = false,
-                UseCookies = false
+                AllowAutoRedirect = true,
+                UseCookies = true,
+                CookieContainer = _cookieContainer,
+                // to be decided : MaxConnectionPerserver by defaut is int.MaxValue which means unlimited connections.
+                MaxConnectionsPerServer = 20
             };
-
             _httpClient = new HttpClient(handler)
             {
-                Timeout = Timeout.InfiniteTimeSpan // We handle timeouts with CancellationTokens
+                Timeout = Timeout.InfiniteTimeSpan, // We handle timeouts with CancellationTokens
             };
+
+            // Disable Expect: 100-continue to avoid extra round-trip on POST requests.
+            // Without this, every append/write sends headers first, waits for "100 Continue",
+            // then sends the body — adding latency to every request.
+            _httpClient.DefaultRequestHeaders.ExpectContinue = false;
+
+            Console.WriteLine($"[ADLS HttpClient] CREATED static HttpClient instance. HashCode={_httpClient.GetHashCode()}");
+            WebTransportLog.Info($"HttpClient initialized (static singleton). " +
+                $"Handler: HttpClientHandler, AutomaticDecompression: GZip|Deflate, " +
+                $"AllowAutoRedirect: true, UseCookies: true, " +
+                $"MaxConnectionsPerServer: 20, " +
+                $"Timeout: InfiniteTimeSpan (managed via CancellationTokens). " +
+                $"HttpClient HashCode: {_httpClient.GetHashCode()}");
         }
 
         #region Common
@@ -424,10 +453,14 @@ namespace Microsoft.Azure.DataLake.Store
             resp.Error = e.Message;
             resp.ConnectionFailure = true;
 
-            if (WebTransportLog.IsErrorEnabled)
-            {
-                WebTransportLog.Error($"HttpRequestException for path {path}, RequestId: {requestId}, Message: {e.Message}");
-            }
+            Console.WriteLine(
+                $"[ADLS HttpClient] !!! CONNECTION FAILURE: cReqId={requestId}, path={path}, " +
+                $"error={e.Message}, innerError={e.InnerException?.Message}");
+
+            WebTransportLog.Error(
+                $"HttpClient connection failure: cReqId:{requestId}, path:{path}, " +
+                $"httpClientHashCode:{_httpClient.GetHashCode()}, totalRequestsSoFar:{_requestCount}, " +
+                $"error:{e.Message}, innerError:{e.InnerException?.Message}");
         }
 
         /// <summary>
@@ -600,6 +633,14 @@ namespace Microsoft.Azure.DataLake.Store
                 resp.Reset();
                 req.RequestId = uuid + "." + numRetries;
                 resp.Retries = numRetries;
+                if (WebTransportLog.IsDebugEnabled)
+                {
+                    WebTransportLog.Debug(
+                        $"MakeCallAsync: op:{opCode}, path:{path}, " +
+                        $"attempt:{numRetries + 1}, cReqId:{req.RequestId}, " +
+                        $"httpClientHashCode:{_httpClient.GetHashCode()}, " +
+                        $"totalRequestsSoFar:{_requestCount}");
+                }
                 Stopwatch watch = Stopwatch.StartNew();
                 retVal = await MakeSingleCallAsync(opCode, path, requestData, responseData, quer, client, req, resp, cancelToken, customHeaders).ConfigureAwait(false);
                 watch.Stop();
@@ -698,18 +739,6 @@ namespace Microsoft.Azure.DataLake.Store
                 // Assign headers
                 AssignCommonHttpHeaders(request, client, req, token, op.Method, customHeaders, requestData.Count);
 
-                // Handle client certificate if needed
-                if (req.ClientCert != null)
-                {
-                    // Note: HttpClient with HttpClientHandler needs certificate added to handler, not per-request
-                    // This would require modifying the static HttpClient or creating a new one
-                    // For now, log a warning
-                    if (WebTransportLog.IsWarnEnabled)
-                    {
-                        WebTransportLog.Warn("Client certificates are not supported with static HttpClient. Consider creating a separate HttpClient instance.");
-                    }
-                }
-
                 using (var timeoutCancellationTokenSource = GetCancellationTokenSourceForTimeout(req))
                 {
                     using (CancellationTokenSource linkedCts =
@@ -763,8 +792,42 @@ namespace Microsoft.Azure.DataLake.Store
                             }
 
                             // Send request
+                            long currentRequestCount = Interlocked.Increment(ref _requestCount);
+                            string requestHostHeader = string.IsNullOrEmpty(request.Headers.Host) ? "(none)" : request.Headers.Host;
+                            
+
+                            if (WebTransportLog.IsDebugEnabled)
+                            {
+                                WebTransportLog.Debug(
+                                    $"HttpClient.SendAsync: reqNo:{currentRequestCount}, " +
+                                    $"method:{request.Method}, url:{request.RequestUri?.Host}{request.RequestUri?.AbsolutePath}, " +
+                                    $"cReqId:{req.RequestId}, " +
+                                    $"httpClientHashCode:{_httpClient.GetHashCode()}, " +
+                                    $"hasContent:{request.Content != null}, " +
+                                    $"contentLength:{request.Content?.Headers.ContentLength ?? 0}");
+                            }
+
                             HttpResponseMessage response = await _httpClient.SendAsync(request, 
                                 HttpCompletionOption.ResponseHeadersRead, linkedCts.Token).ConfigureAwait(false);
+
+                            using (response)
+                            {
+                            string connHeader = response.Headers.Connection.Any() ? string.Join(",", response.Headers.Connection) : "(none)";
+                            string keepAliveHeader = response.Headers.TryGetValues("Keep-Alive", out var keepAliveValues) ? string.Join(",", keepAliveValues) : "(none)";
+                            string serverHeader = response.Headers.TryGetValues("X-Origin-ServerName", out var serverValues) ? string.Join(",", serverValues) : "(none)";
+
+                            if (WebTransportLog.IsDebugEnabled)
+                            {
+                                string connHeaderLog = response.Headers.Connection.Any() 
+                                    ? string.Join(",", response.Headers.Connection) : "none";
+                                WebTransportLog.Debug(
+                                    $"HttpClient.Response: reqNo:{currentRequestCount}, " +
+                                    $"status:{(int)response.StatusCode} {response.StatusCode}, " +
+                                    $"cReqId:{req.RequestId}, " +
+                                    $"connectionHeader:{connHeaderLog}, " +
+                                    $"transferEncoding:{response.Headers.TransferEncodingChunked?.ToString() ?? "N/A"}, " +
+                                    $"totalRequestsSoFar:{_requestCount}");
+                            }
 
                             // Check for success
                             if (!response.IsSuccessStatusCode)
@@ -815,6 +878,7 @@ namespace Microsoft.Azure.DataLake.Store
                             }
 
                             return Tuple.Create<byte[], int>(null, 0);
+                            } // using (response) — connection returned to pool here
                         }
                         catch (HttpRequestException e)
                         {
@@ -871,6 +935,14 @@ namespace Microsoft.Azure.DataLake.Store
                 resp.Reset();
                 req.RequestId = uuid + "." + numRetries;
                 resp.Retries = numRetries;
+                if (WebTransportLog.IsDebugEnabled)
+                {
+                    WebTransportLog.Debug(
+                        $"MakeCall(sync): op:{opCode}, path:{path}, " +
+                        $"attempt:{numRetries + 1}, cReqId:{req.RequestId}, " +
+                        $"httpClientHashCode:{_httpClient.GetHashCode()}, " +
+                        $"totalRequestsSoFar:{_requestCount}");
+                }
                 Stopwatch watch = Stopwatch.StartNew();
                 retVal = MakeSingleCall(opCode, path, requestData, responseData, quer, client, req, resp, customHeaders);
                 watch.Stop();
@@ -910,6 +982,12 @@ namespace Microsoft.Azure.DataLake.Store
         /// <returns>Tuple of Byte array containing the bytes returned from the server and number of bytes read from server</returns>
         private static Tuple<byte[], int> MakeSingleCall(string opCode, string path, ByteBuffer requestData, ByteBuffer responseData, QueryParams qp, AdlsClient client, RequestOptions req, OperationResponse resp, IDictionary<string, string> customHeaders)
         {
+            if (WebTransportLog.IsDebugEnabled)
+            {
+                WebTransportLog.Debug(
+                    $"MakeSingleCall(sync): delegating to async, op:{opCode}, path:{path}, " +
+                    $"cReqId:{req.RequestId}, httpClientHashCode:{_httpClient.GetHashCode()}");
+            }
             // Call the async version synchronously
             // This is not ideal but maintains backward compatibility for sync callers
             return MakeSingleCallAsync(opCode, path, requestData, responseData, qp, client, req, resp, CancellationToken.None, customHeaders).GetAwaiter().GetResult();
