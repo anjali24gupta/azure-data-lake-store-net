@@ -60,11 +60,6 @@ namespace Microsoft.Azure.DataLake.Store
     /// </summary>
     private static long _requestCount;
 
-    /// <summary>
-    /// Shared cookie container to preserve affinity cookies across requests.
-    /// </summary>
-    private static readonly CookieContainer _cookieContainer = new CookieContainer();
-
         /// <summary>
         /// Static constructor to initialize HttpClient once
         /// </summary>
@@ -77,8 +72,6 @@ namespace Microsoft.Azure.DataLake.Store
             {
                 AutomaticDecompression = DecompressionMethods.GZip | DecompressionMethods.Deflate,
                 AllowAutoRedirect = true,
-                UseCookies = true,
-                CookieContainer = _cookieContainer,
                 // to be decided : MaxConnectionPerserver by defaut is int.MaxValue which means unlimited connections.
                 MaxConnectionsPerServer = 20
             };
@@ -95,7 +88,7 @@ namespace Microsoft.Azure.DataLake.Store
             Console.WriteLine($"[ADLS HttpClient] CREATED static HttpClient instance. HashCode={_httpClient.GetHashCode()}");
             WebTransportLog.Info($"HttpClient initialized (static singleton). " +
                 $"Handler: HttpClientHandler, AutomaticDecompression: GZip|Deflate, " +
-                $"AllowAutoRedirect: true, UseCookies: true, " +
+                $"AllowAutoRedirect: true, " +
                 $"MaxConnectionsPerServer: 20, " +
                 $"Timeout: InfiniteTimeSpan (managed via CancellationTokens). " +
                 $"HttpClient HashCode: {_httpClient.GetHashCode()}");
@@ -339,11 +332,6 @@ namespace Microsoft.Azure.DataLake.Store
             // Add custom headers
             if (customHeaders != null)
             {
-                string contentType;
-                if (customHeaders.TryGetValue("Content-Type", out contentType))
-                {
-                    // Content-Type handled separately on HttpContent
-                }
                 foreach (var key in customHeaders.Keys)
                 {
                     if (!HeadersNotToBeCopied.Contains(key))
